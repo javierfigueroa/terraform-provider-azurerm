@@ -16,6 +16,7 @@ no-hard-tabs:
 # MD033: no inline HTML - allow the elements the docs and README legitimately use
 no-inline-html:
   allowed_elements:
+    - a
     - br
     - details
     - img
@@ -36,6 +37,10 @@ line-length: false
 
 # MD014: shell commands must not use `$` prompts unless output is shown
 commands-show-output: false
+
+# MD028: no blank line between blockquotes - our docs intentionally stack separate
+# note/example callouts as adjacent blockquotes
+no-blanks-blockquote: false
 
 # MD024: no duplicate heading text - every resource doc repeats the same section names
 # (Example Usage, Arguments Reference, Attributes Reference, Timeouts, Import)
