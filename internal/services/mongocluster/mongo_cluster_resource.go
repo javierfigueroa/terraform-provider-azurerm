@@ -269,12 +269,16 @@ func (r MongoClusterResource) Arguments() map[string]*pluginsdk.Schema {
 		},
 
 		"storage_type": {
-			Type:         pluginsdk.TypeString,
-			Optional:     true,
-			ForceNew:     true,
-			Default:      string(mongoclusters.StorageTypePremiumSSD),
+			Type:     pluginsdk.TypeString,
+			Optional: true,
+			Computed: true,
+			ForceNew: true,
+			// No `Default` here on purpose. A static default would be sent to the service
+			// even when the practitioner never configured `storage_type`, which prevents the
+			// service from applying its own contextual default. `Computed` lets the service
+			// supply the value and keeps existing resources (which already have a concrete
+			// type in state) from generating a spurious ForceNew diff.
 			ValidateFunc: validation.StringInSlice(mongoclusters.PossibleValuesForStorageType(), false),
-			RequiredWith: []string{"storage_size_in_gb"},
 		},
 
 		"tags": commonschema.Tags(),
@@ -410,10 +414,18 @@ func (r MongoClusterResource) Create() sdk.ResourceFunc {
 			parameter.Properties.PublicNetworkAccess = pointer.ToEnum[mongoclusters.PublicNetworkAccess](state.PublicNetworkAccess)
 
 			if state.StorageSizeInGb != 0 {
-				parameter.Properties.Storage = &mongoclusters.StorageProperties{
+				storage := &mongoclusters.StorageProperties{
 					SizeGb: pointer.To(state.StorageSizeInGb),
-					Type:   pointer.ToEnum[mongoclusters.StorageType](state.StorageType),
 				}
+				// Send `type` only when a value is actually known at this point. It is empty
+				// exactly when the practitioner left `storage_type` unset and the service is
+				// therefore the one choosing, which covers both a brand new cluster and a
+				// cluster being recreated by a replacement. An explicitly configured value is
+				// populated here and must be sent.
+				if state.StorageType != "" {
+					storage.Type = pointer.ToEnum[mongoclusters.StorageType](state.StorageType)
+				}
+				parameter.Properties.Storage = storage
 			}
 
 			if state.Tags != nil {
@@ -713,6 +725,10 @@ func (r MongoClusterResource) CustomizeDiff() sdk.ResourceFunc {
 				return fmt.Errorf("DecodeDiff: %+v", err)
 			}
 
+			// Tracks the ForceNew calls made below. Those are decided here rather than by the
+			// schema, so they are invisible to replacementPlanned.
+			replacementForced := false
+
 			switch state.CreateMode {
 			case string(mongoclusters.CreateModeDefault):
 				if isNativeAuthRequired(metadata) && state.AdministratorUserName == "" {
@@ -770,6 +786,7 @@ func (r MongoClusterResource) CustomizeDiff() sdk.ResourceFunc {
 
 			// Since the API doesn't return the value of create_mode, when importing `azurerm_mongo_cluster`, it will cause replacement.
 			if oldVal, newVal := metadata.ResourceDiff.GetChange("create_mode"); oldVal.(string) != "" && oldVal.(string) != newVal.(string) {
+				replacementForced = true
 				if err := metadata.ResourceDiff.ForceNew("create_mode"); err != nil {
 					return err
 				}
@@ -781,6 +798,7 @@ func (r MongoClusterResource) CustomizeDiff() sdk.ResourceFunc {
 
 			// Service team confirmed that `data_api_mode_enabled` can only be updated to `Enabled` after the cluster has been created
 			if oldVal, newVal := metadata.ResourceDiff.GetChange("data_api_mode_enabled"); oldVal.(bool) && !newVal.(bool) && state.CreateMode == string(mongoclusters.CreateModeDefault) {
+				replacementForced = true
 				if err := metadata.ResourceDiff.ForceNew("data_api_mode_enabled"); err != nil {
 					return err
 				}
@@ -792,14 +810,69 @@ func (r MongoClusterResource) CustomizeDiff() sdk.ResourceFunc {
 			// otherwise it will throw a schema validation error, Terraform can only dynamically treat this change as forceNew.
 			// 2. Service API will fail when identity type is changed from `None` to `UserAssigned`.
 			if oldVal, newVal := metadata.ResourceDiff.GetChange("identity"); (len(oldVal.([]interface{})) > 0 && len(newVal.([]interface{})) == 0) || (len(oldVal.([]interface{})) == 0 && len(newVal.([]interface{})) > 0) {
+				replacementForced = true
 				if err := metadata.ResourceDiff.ForceNew("identity"); err != nil {
 					return err
+				}
+			}
+
+			// A replacement recreates the cluster, and the storage type of the new cluster is
+			// decided by the service when `storage_type` is absent from the request. The provider
+			// cannot carry the existing type across a replacement: when a diff requires a new
+			// resource, helper/schema discards the state and re-runs this function with no access
+			// to the previous value, so anything set here on the first pass is thrown away.
+			//
+			// That makes a replacement of a cluster whose configuration omits `storage_type` a
+			// silent storage migration. It has been observed downgrading a PremiumSSDv2 cluster
+			// to PremiumSSD, taking the provisioned IOPS and throughput that only PremiumSSDv2
+			// supports with it, off the back of an unrelated `identity` change. The plan gives no
+			// warning, because the value simply shows as "known after apply".
+			//
+			// helper/schema has no way to raise a warning from CustomizeDiff, so the only way to
+			// stop that happening by accident is to refuse the plan and ask for the storage type
+			// to be stated. Setting it explicitly also makes the plan show the concrete type
+			// instead of an unknown, so the outcome is visible before apply.
+			if metadata.ResourceDiff.Id() != "" {
+				if rawConfig := metadata.ResourceDiff.GetRawConfig(); !rawConfig.IsNull() {
+					if rawConfig.AsValueMap()["storage_type"].IsNull() {
+						if existing, _ := metadata.ResourceDiff.GetChange("storage_type"); existing.(string) != "" {
+							if replacementForced || r.replacementPlanned(metadata) {
+								return fmt.Errorf("this change requires %s to be replaced, and `storage_type` is not set in the configuration. "+
+									"The replacement would be created with the storage type the service selects rather than the %[2]q it uses today, "+
+									"which can silently change the storage type of the cluster. "+
+									"Set `storage_type = %[2]q` to keep the current storage type, or set `storage_type` to the type the replacement should use, then plan again",
+									metadata.ResourceDiff.Id(), existing.(string))
+							}
+						}
+					}
 				}
 			}
 
 			return nil
 		},
 	}
+}
+
+// replacementPlanned reports whether any attribute the schema marks ForceNew has changed,
+// which is how a replacement gets triggered for everything except the handful of cases
+// CustomizeDiff decides for itself.
+//
+// helper/schema does not expose "this diff requires a new resource" while the diff is being
+// customised, so the condition has to be reconstructed. Deriving the attribute list from
+// the schema rather than hard-coding it means an attribute that becomes ForceNew later is
+// picked up automatically.
+func (r MongoClusterResource) replacementPlanned(metadata sdk.ResourceMetaData) bool {
+	for name, field := range r.Arguments() {
+		if !field.ForceNew {
+			continue
+		}
+
+		if metadata.ResourceDiff.HasChange(name) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func expandPreviewFeatures(input []string) *[]mongoclusters.PreviewFeature {

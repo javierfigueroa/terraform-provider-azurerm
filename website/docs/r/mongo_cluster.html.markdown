@@ -83,7 +83,11 @@ The following arguments are supported:
 
 * `storage_size_in_gb` - (Optional) The size of the data disk space for the MongoDB Cluster.
 
-* `storage_type` - (Optional) The storage type for the MongoDB Cluster. Possible values are `PremiumSSD` and `PremiumSSDv2`. Defaults to `PremiumSSD`. Changing this forces a new resource to be created.
+* `storage_type` - (Optional) The storage type for the MongoDB Cluster. Possible values are `PremiumSSD` and `PremiumSSDv2`. Changing this forces a new resource to be created.
+
+~> **Note:** When `storage_type` is omitted, the storage type is selected by the service and exported back into state. Omitting this property does not modify the storage type of an existing MongoDB Cluster.
+
+~> **Note:** If a change would replace an existing MongoDB Cluster and `storage_type` is not set, the plan is rejected. A replacement is created with the storage type the service selects, which is not necessarily the type the cluster uses today, so `storage_type` must be set explicitly to confirm which storage type the replacement should have.
 
 * `version` - (Optional) The version for the MongoDB Cluster. Possibles values are `5.0`, `6.0`, `7.0` and `8.0`.
 
